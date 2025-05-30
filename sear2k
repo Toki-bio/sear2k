@@ -1,0 +1,142 @@
+#!/bin/bash
+# sear2k - A tool for finding short sequences in genomes using ssearch36
+# Author: Sergei Kosushkin
+# Version: 0.1
+# License: MIT
+
+# Searches query sequences in a genome bank file after splitting into fragments with overlap
+
+# Usage:
+# sear2k <query.fasta> <bank.fasta> [sequence_length_fraction=0.9] [similarity_threshold=65]
+# Example:
+# sear2k my_sine.fasta genome.bnk 0.9 65
+
+# Output:
+# Creates <genome>-<query>.bed with coordinates and <genome>-<query>.bnk with sequences
+
+# WARNING: Does not work with underscores in fasta names in the bank file!
+#          Pre-process your bank file with: awk '{gsub(/_/,"")}1' genome.fna > genome.bnk
+
+# Dependencies: ssearch36, bedtools, seqkit, samtools
+
+# todo: adjustable flanks; output sort; option to remain temporary .2k genome split files, accept any genome file extension
+
+# Function to convert seconds to hours:minutes:seconds
+T0=$(date +%s); T1=$(date +%s)
+Secs_HMS() { echo "  done in $(( ${1} / 3600 ))h $(( (${1} / 60) % 60 ))m $(( ${1} % 60 ))s"; }
+
+# Check for underscores in genome FASTA names
+if grep -q "_" <(grep "^>" "$2"); then
+    echo "ERROR: Bank file contains underscores in sequence names" >&2
+    echo "Run: awk '{gsub(/_/,\"\")}1' ${2} > ${2%.*}_clean.${2##*.}" >&2
+    exit 1
+fi
+
+# Check for required arguments
+if [[ $# -eq 0 ]] ; then
+    echo 'No arguments supplied!'
+    exit 1
+fi
+
+# Verify all required programs are available
+Files=($(which "ssearch36") $(which "bedtools") $(which "seqkit") "$1" )
+for f in "${Files[@]}" ; do
+  if [ ! -f "$f" ]; then
+    echo "File $f: not found"
+    exit 1
+  fi
+done
+
+# Default values
+Slf=${3:-0.9}         # Sequence Length Fraction (default 0.9)
+Homology=${4:-65}     # Similarity threshold (default 65%)
+
+# Calculate query length and overlap length
+len=$(awk '/^>/{if (l!="") print l; l=0; next}{l+=length($0)}END{print l}' $1) #Query length calculation
+flen=$(awk -v a=$Slf -v b=$len 'BEGIN{flen=int(a*b); print flen;}')
+echo Query length = $len bp, overlap = $flen bp
+
+# Split bank into fragments if needed
+if ls | grep -q "^${2}.*2k\.bnk$"; then
+    echo "Skipping 2k split: ${2}2k.bnk exists"
+else
+    echo "Splitting bank"
+    seqkit sliding -g -s 2000 -W 2500 $2 | sed 's/sliding://g' > $2".2k.bnk"
+fi
+
+# Searching
+for p in *2k.bnk; do 
+  bank=$p # name of bank2k file
+  echo bank= $bank
+  query=$1 # query name
+  bname=${bank%???????} # name of bank without 2k
+  echo bname= $bname
+  taxname=$(echo $bank | cut -c 1-3) # First 3 characters of genome file as taxon name
+  echo taxname= $taxname
+  qname=${query%??} # query name fithout file extension
+  echo qname= $qname
+
+
+    # First round of searching
+    k=$(( 1 ))
+    Pl=$(( 1 ))
+    while [[ $Pl != "0" ]]
+     do
+      echo Searching $qname in $bank, round $k
+      
+      # Run ssearch36 and process output
+      ssearch36 -g -3 -T 24 -Q -n -z 11 -E 2 -w 95 -W 70 -m 8C $1 $bank 3 \
+      | awk  '/^[^#]/ {printf($2"\t"$9-1"\t"$10"\t"$10-$9+1"\t"); if ($8-$7>0) print$8-$7+1"\t""+""\t"$3"\t"$12; else print-($8-$7+1)"\t""-""\t"$3"\t"$12 }' \
+      | sort -V  \
+      | bedtools merge -s -c 4,5,6,7,8 -o max,max,distinct,max,max \
+      | awk '{if ($7>='$Homology' && $4>='$flen') print}' \
+      | sort -V $i > plus_to_add_$k.bed \
+      || exit 1
+     cp plus_to_add_$k.bed plus.bed
+     Secs_HMS "$(($(date +%s) - ${T1}))"; T1=$(date +%s)
+     Plus1_len=$(wc -l plus_to_add_$k.bed)
+     Pl=$(wc -l < plus_to_add_$k.bed)
+
+     echo "$Plus1_len hits found in round $k"
+
+     samtools faidx $p
+     sort -V $p.fai > "$p"_s.fai
+     samtools faidx $bname
+     
+     # Process output for subsequent rounds
+     if [[ $k -gt 1 ]] 
+      then
+       awk 'OFS="\t" {sub(/-/,"\t",$1); gsub(/_/,"\t",$1); { sub(/\()/,"",$1)}; {print $1,$2,$3,$4,$5,$6,$7,$8}; }' plus_to_add_$k.bed \
+       | awk 'OFS="\t" {sub(/-/,"\t",$4)}; {print}' | awk 'OFS="\t" {print $1"_"$2"-"$3,$4+$6,$4+$7,$7,$8,$10,$11,$12}' > temp
+       mv temp plus_to_add_$k.bed
+       cat *_to_add_*.bed | sort -V > plus.bed
+     fi
+     
+     # Regions not yet matched are stored in a depleted minus bank for subsequent rounds
+     bedtools complement -i plus.bed -g "$p"_s.fai \
+      | bedtools getfasta -s -fi $p -bed stdin \
+      | awk '/^>/ && a!=1 {gsub(/[":"]/, "_")}{gsub(/["()"]/,"");a=1};a=0;1' > minus_$k.bnk
+     cp plus.bed $p.bed
+     bank=$"minus_"$k.bnk
+     k=$(( $k+1 ))
+    done
+done
+
+#             FINAL EXTRACTION
+echo "Extracting sequences" 
+bank=$2
+taxname=${bank%????} 
+rm minus*.bnk
+cat *.bnk.bed > plus.bed
+bname=$2
+
+samtools faidx $2
+cat plus.bed | awk -F "\t|_|-" ' {printf $1"\t"$2+$4-1"\t"$2+$5-1"\t"$6"\t"$7"\t";if ($8=="+") print $8"\t"$9"\t"$10; else print "-""\t"$10"\t"$11}' | sort -V \
+| bedtools merge -s -c 4,5,6,7,8 -o max,max,distinct,max,max -i stdin > $taxname-$qname.bed
+bedtools slop -s -i $taxname-$qname.bed -g $bname.fai -l 50 -r 50 > $taxname.bed
+bedtools getfasta -s -fi $bname -bed $taxname.bed > $taxname-$qname.bnk
+rm *.fai plus.bed $taxname.bed
+
+Secs_HMS "$(($(date +%s) - ${T1}))"; T1=$(date +%s)
+Result=$(wc -l $taxname-$qname.bed)
+echo Found $Result hits
