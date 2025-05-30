@@ -7,7 +7,7 @@
 # Searches query sequences in a genome bank file after splitting into fragments with overlap
 
 # Usage:
-# sear2k <query.fasta> <bank.fasta> [sequence_length_fraction=0.9] [similarity_threshold=65] [flank_size=100]  [keep_2k_splits=0]
+# sear2k <query.fasta> <bank.fasta> [sequence_length_fraction=0.9] [similarity_threshold=65] [flank_size=50]  [keep_2k_splits=0]
 # Example:
 # sear2k my_sine.fasta genome.bnk 0.9 65 100 1
 
