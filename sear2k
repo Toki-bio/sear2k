@@ -80,7 +80,7 @@ if [[ $split != "0" ]]; then
 fi
 
 query=$1
-qname=${query%??} # query name fithout file extension
+qname=$(basename "$query") # query name fithout file extension
 taxname=$(echo $2 | cut -c 1-3)
 touch "$2".all_hits.txt
 
