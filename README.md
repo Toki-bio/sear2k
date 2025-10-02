@@ -31,7 +31,7 @@ Fast version; consider sear2kloop for more thorough but slower algorithm.
 
 ### Install sear2k
 
-git clone https://github.com/yourusername/sear2k.git
+git clone https://github.com/Toki-bio/sear2k.git
 cd sear2k
 chmod +x sear2k
 
