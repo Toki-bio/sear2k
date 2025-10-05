@@ -29,12 +29,6 @@ Fast version; consider sear2kloop for more thorough but slower algorithm.
 - [`samtools`](http://www.htslib.org/)
 
 
-### Install sear2k
-
-git clone https://github.com/Toki-bio/sear2k.git
-cd sear2k
-chmod +x sear2k
-
 ## Limitations
 
 **Underscores in FASTA names**: Sequence names with underscores are not supported. Preprocess your genome file like so:
