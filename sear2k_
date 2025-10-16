@@ -1,0 +1,199 @@
+#!/bin/bash
+# sear2k - A tool for finding short sequences in genomes using ssearch36
+# Author: Sergei Kosushkin
+# Version: 0.2
+# License: MIT
+
+# Searches query sequences in a genome bank file after splitting into fragments with overlap
+
+# Usage:
+# sear2k <query.fasta> <bank.fasta> [sequence_length_fraction=0.9] [similarity_threshold=65] [flank_size=50]  [keep_2k_splits=0]
+# Example:
+# sear2k my_sine.fasta genome.bnk 0.9 65 100 1
+
+# Output:
+# Creates <genome>-<query>.bed with coordinates and <genome>-<query>.bnk with sequences
+
+# Dependencies: ssearch36, bedtools, seqkit, samtools
+
+# Function to convert seconds to hours:minutes:seconds
+T0=$(date +%s); T1=$(date +%s)
+Secs_HMS() { echo "  done in $(( ${1} / 3600 ))h $(( (${1} / 60) % 60 ))m $(( ${1} % 60 ))s"; }
+
+# Check for required arguments
+if [[ $# -eq 0 ]] ; then
+    echo 'No arguments supplied!'
+    exit 1
+fi
+
+# Verify all required programs are available
+Files=($(which "ssearch36") $(which "bedtools") $(which "seqkit") "$1" "$2")
+for f in "${Files[@]}" ; do
+  if [ ! -f "$f" ]; then
+    echo "File $f: not found"
+    exit 1
+  fi
+done
+
+# Variables for original and working bank file
+ORIGINAL_BANK="$2"
+WORKING_BANK="$2"
+TEMP_BANK_CREATED=0
+
+# Check if .fai index exists for original bank
+fai=$(ls 2>/dev/null | grep -x "$ORIGINAL_BANK".fai)
+if [[ $fai != "" ]];
+    then
+        echo "fai index found"
+    else
+        echo "Creating fai index..."
+        samtools faidx "$ORIGINAL_BANK"
+fi
+
+# Check for underscores in genome FASTA names
+underscores=$(awk '/_/' "$ORIGINAL_BANK".fai)
+if [[ $underscores != "" ]];
+    then
+        echo "WARNING: Bank file contains underscores in sequence names"
+        echo "Creating temporary copy with placeholder substitution..."
+        
+        # Create temporary cleaned bank file - replace _ with @UNDERSCORE@
+        TEMP_BANK="${ORIGINAL_BANK%.*}_temp_clean.${ORIGINAL_BANK##*.}"
+        awk '{gsub(/_/,"@UNDERSCORE@")}1' "$ORIGINAL_BANK" > "$TEMP_BANK"
+        
+        # Index the cleaned file
+        samtools faidx "$TEMP_BANK"
+        
+        # Use the cleaned file as working bank
+        WORKING_BANK="$TEMP_BANK"
+        TEMP_BANK_CREATED=1
+        
+        echo "Using temporary cleaned bank: $WORKING_BANK"
+    else
+        echo "No underscores detected - using original bank file"
+fi
+
+# Default values
+Slf=${3:-0.9}         # Sequence Length Fraction (default 0.9)
+Homology=${4:-65}     # Similarity threshold (default 65%)
+FlankSize=${5:-50}    # Flank size in bp (default 50)
+KeepSplits=${6:-0}    # Keep temporary split files (default: delete)
+
+# Calculate query length and overlap length
+len=$(awk '/^>/{if (l!="") print l; l=0; next}{l+=length($0)}END{print l}' $1) #Query length calculation
+flen=$(awk -v a=$Slf -v b=$len 'BEGIN{flen=int(a*b); print flen;}')
+echo Query length = $len bp, overlap = $flen bp
+
+# Split bank into fragments if needed
+# check if 2k split exists
+split=$(ls 2>/dev/null | grep "$WORKING_BANK".part_* | grep .2k.part_ | wc -l)
+if [[ $split != "0" ]]; then
+        echo "skipping 2k split"
+    else
+        seqkit sliding -g -s 2000 -W 2500 "$WORKING_BANK" > "$WORKING_BANK"."2k.bnk"
+        seqkit split2 -p 20 -O . "$WORKING_BANK"."2k.bnk"
+fi
+
+query=$1
+qname="${query%.*}" # query name without file extension
+taxname=$(echo "$WORKING_BANK" | cut -c 1-3)
+touch "$WORKING_BANK".all_hits.txt
+
+# Searching
+for bank in *.2k.part_*; do
+    echo searching $query in $bank
+    taxname=$(echo $bank | cut -c 1-3) # name of taxa
+
+    # First round of searching
+    round=$(( 1 ))
+    Pl=$(( 1 ))
+
+    while [[ $Pl != "0" ]]
+     do
+         echo round $round
+         echo $query $bank
+
+      # Run ssearch36 and process output
+      ssearch36 -g -3 -T 24 -Q -n -z 11 -E 2 -w 95 -W 70 -m 8C $query $bank 3 \
+      | awk  '/^[^#]/ {printf($2"\t"$9-1"\t"$10"\t"$10-$9+1"\t"); if ($8-$7>0) print$8-$7+1"\t""+""\t"$3; else print-($8-$7+1)"\t""-""\t"$3 }' \
+      | sort -V  \
+      | bedtools merge -s -c 4,5,6,7 -o max,max,distinct,max \
+      | awk '{if ($7>='$Homology' && $4>='$flen') print}' \
+      | sort -V $i > plus_to_add_"$round"_"$bank".bed \
+
+    Pl=$(wc -l < plus_to_add_"$round"_"$bank".bed)
+    echo $Pl hits
+
+        cat plus_to_add_"$round"_"$bank".bed >> "$WORKING_BANK".all_hits.txt
+
+     samtools faidx $bank
+     sort -V $bank.fai > "$bank"_s.fai
+
+        if [ "$Pl" == "0" ]; then
+            round=$(( $round+1 ))
+            break
+        fi
+
+    echo creating minus bank
+
+    cat plus_to_add_*_"$bank".bed | sort -V > "$round"_"$bank".bed
+
+    bedtools complement -i "$round"_"$bank".bed -g "$bank"_s.fai \
+      | bedtools sort -i \
+      | bedtools getfasta -s -fi $bank -bed - \
+      | awk '/^>/ && a!=1 {gsub(/[":"]/, "_")}{gsub(/["()"]/,"");a=1};a=0;1' > minus_"$round"_"$bank"
+    bank=$( echo minus_"$round"_"$bank")
+    round=$(( $round+1 ))
+    echo $bank $round
+    done
+done
+
+cat "$WORKING_BANK".all_hits.txt |
+ awk '{sub(/_sliding:/," ")}{sub(/_sliding_/," ")}{print $2}' |
+ awk '{gsub(/_/," ")}{print}' |
+ awk '{gsub(/-/," -")}1' |
+ awk '{sum=0;for(i=1;i<=NF;i++)if($i>0)sum+=$i}{print sum}' > "$WORKING_BANK".all
+paste "$WORKING_BANK".all_hits.txt "$WORKING_BANK".all | awk '{print $0,$2+$NF,$3+$NF}' OFS="\t" |
+ awk '{sub(/_sliding/," ")}{print $1,$(NF-1),$NF,$(NF-3),$(NF-5),$(NF-4)}' OFS="\t" |
+ bedtools sort -i - | bedtools slop -l 1 -r -1 -i - -g "$WORKING_BANK".fai | bedtools merge -s -i - -c 4,5,6 -o max,max,distinct > $taxname-$qname.bed
+
+
+#             FINAL EXTRACTION
+echo Extracting sequences
+rm *2k.part* "$WORKING_BANK".all "$WORKING_BANK".all_hits.txt "$WORKING_BANK"."2k.bnk"
+
+bname="$WORKING_BANK"
+
+bedtools slop -s -i $taxname-$qname.bed -g $bname.fai -l $FlankSize -r $FlankSize > $taxname.bed
+bedtools getfasta -s -fi $bname -bed $taxname.bed > $taxname-$qname.bnk
+rm $taxname.bed
+
+# Restore underscores in output files if temp bank was used
+if [[ $TEMP_BANK_CREATED -eq 1 ]]; then
+    echo "Restoring original sequence names in output files..."
+    # Restore underscores in BED file
+    awk '{gsub(/@UNDERSCORE@/,"_")}1' $taxname-$qname.bed > ${taxname}-${qname}.bed.tmp
+    mv ${taxname}-${qname}.bed.tmp $taxname-$qname.bed
+    
+    # Restore underscores in bank file (FASTA headers)
+    awk '{gsub(/@UNDERSCORE@/,"_")}1' $taxname-$qname.bnk > ${taxname}-${qname}.bnk.tmp
+    mv ${taxname}-${qname}.bnk.tmp $taxname-$qname.bnk
+fi
+
+rm *.fai plus.bed 2>/dev/null
+if [[ $KeepSplits -eq 0 ]]; then
+    rm -f *2k.bnk *2k.bnk.fai *_s.fai
+    echo "Temporary split files removed"
+else
+    echo "Temporary split files kept for re-use"
+fi
+
+# Clean up temporary bank file if it was created
+if [[ $TEMP_BANK_CREATED -eq 1 ]]; then
+    echo "Removing temporary cleaned bank file..."
+    rm -f "$TEMP_BANK" "$TEMP_BANK".fai
+    echo "Cleanup complete"
+fi
+
+Result=$(wc -l $taxname-$qname.bed)
+echo Found $Result hits
