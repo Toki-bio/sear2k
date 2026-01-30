@@ -180,7 +180,8 @@ if [[ $TEMP_BANK_CREATED -eq 1 ]]; then
     mv ${taxname}-${qname}.bnk.tmp $taxname-$qname.bnk
 fi
 
-rm *.fai plus.bed 2>/dev/null
+rm -f *2k.bnk.fai *_s.fai 2>/dev/null rm -f plus.bed 2>/dev/null
+
 if [[ $KeepSplits -eq 0 ]]; then
     rm -f *2k.bnk *2k.bnk.fai *_s.fai
     echo "Temporary split files removed"
