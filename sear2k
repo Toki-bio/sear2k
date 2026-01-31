@@ -1,11 +1,15 @@
 #!/bin/bash
 # sear2k - A tool for finding short sequences in genomes using ssearch36
 # Author: Sergei Kosushkin
-# Version: 0.2 + minimal additions (bitscore + -b/--best + best flank50)
+# Version: 0.2 + minimal additions (bitscore + -b/--best + best flank50 + -m/--minus)
 # License: MIT
 #
 # Usage:
-# sear2k [-b|--best [N]] <query.fasta> <bank.fasta> [sequence_length_fraction=0.9] [similarity_threshold=65] [flank_size=50] [keep_2k_splits=0]
+# sear2k [-b|--best [N]] [-m|--minus] <query.fasta> <bank.fasta> [sequence_length_fraction=0.9] [similarity_threshold=65] [flank_size=50] [keep_2k_splits=0]
+#
+# Options:
+#   -b, --best [N]   Take top N hits by bitscore (default 100), extract with .50bp flanks, align with MAFFT
+#   -m, --minus      Skip minus-bank depletion rounds (single round per split bank)
 #
 # Dependencies: ssearch36, bedtools, seqkit, samtools (mafft if -b/--best)
 
@@ -18,11 +22,14 @@ if [[ $# -eq 0 ]] ; then
 fi
 
 # -----------------------------
-# parse -b / --best [N]
-# default N=100
+# parse options:
+#   -b / --best [N]  (default N=100)
+#   -m / --minus     (skip minus-bank rounds)
 # -----------------------------
 BEST=0
 BEST_N=100
+SKIP_MINUS=0
+
 args=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -40,6 +47,10 @@ while [[ $# -gt 0 ]]; do
       BEST_N="${1#-b}"
       shift 1
       ;;
+    --minus|-m)
+      SKIP_MINUS=1
+      shift 1
+      ;;
     --)
       shift
       args+=("$@")
@@ -54,7 +65,7 @@ done
 set -- "${args[@]}"
 
 if [[ $# -lt 2 ]]; then
-  echo "Usage: sear2k [-b|--best [N]] <query.fasta> <bank.fasta> [Slf=0.9] [Homology=65] [Flank=50] [KeepSplits=0]"
+  echo "Usage: sear2k [-b|--best [N]] [-m|--minus] <query.fasta> <bank.fasta> [Slf=0.9] [Homology=65] [Flank=50] [KeepSplits=0]"
   exit 1
 fi
 
@@ -176,6 +187,14 @@ for bank in *.2k.part_*.bnk; do
           break
       fi
 
+      # -----------------------------
+      # NEW OPTION: -m/--minus
+      # Skip depletion/minus-bank rounds (single round per split bank)
+      # -----------------------------
+      if [[ $SKIP_MINUS -eq 1 ]]; then
+          break
+      fi
+
       echo creating minus bank
 
       cat plus_to_add_*_"$bank".bed | sort -V > "$round"_"$bank".bed
@@ -238,7 +257,7 @@ if [[ $BEST -eq 1 ]]; then
     $taxname-$qname.best${BEST_N}.bed7 \
   > $taxname-$qname.best${BEST_N}.bed
 
-  # Add 50bp flanks both sides (strand-aware)
+  # Add .50bp flanks for best sequences (strand-aware)
   bedtools slop -s -g "$WORKING_BANK".fai -b 50 -i $taxname-$qname.best${BEST_N}.bed \
   > $taxname-$qname.best${BEST_N}.flank50.bed
 
