@@ -6,10 +6,15 @@
 #
 # Usage:
 # sear [-b|--best [N]] [-m|--minus] [-s|--stop [N]] <query.fasta> <bank.fasta> \
-#        [sequence_length_fraction=0.9] [similarity_threshold=65] [flank_size=50] [keep_2k_splits=0]
+#        [sequence_length_fraction=0.8] [similarity_threshold=65] [flank_size=50] [keep_2k_splits=0]
+#
+# Notes (2026-02-03 edit):
+#   - Default Slf changed from 0.9 -> 0.8
+#   - Default: NO minus-bank rounds
+#   - -m / --minus enables minus-bank rounds (the ONLY minus-related option)
 
 usage() {
-  echo "Usage: sear [-b|--best [N]] [-m|--minus] [-s|--stop [N]] <query.fasta> <bank.fasta> [Slf=0.9] [Homology=65] [Flank=50] [KeepSplits=0]"
+  echo "Usage: sear [-b|--best [N]] [-m|--minus] [-s|--stop [N]] <query.fasta> <bank.fasta> [Slf=0.8] [Homology=65] [Flank=50] [KeepSplits=0]"
 }
 
 if [[ $# -eq 0 ]]; then
@@ -23,7 +28,10 @@ fi
 # -----------------------------
 BEST=0
 BEST_N=100
-SKIP_MINUS=0
+
+# DEFAULT: do NOT do minus-bank rounds
+DO_MINUS=0
+
 STOP_EARLY=0
 STOP_N=1000
 
@@ -45,7 +53,8 @@ while [[ $# -gt 0 ]]; do
       shift 1
       ;;
     --minus|-m)
-      SKIP_MINUS=1
+      # ENABLE minus-bank rounds
+      DO_MINUS=1
       shift 1
       ;;
     --stop|-s)
@@ -121,11 +130,8 @@ fi
 # ============================================
 # UNDERSCODE AND TAB WORKAROUND - FIXED VERSION
 # ============================================
-# Check for underscores in .fai file
 underscores=$(awk '/_/' "$ORIGINAL_BANK".fai 2>/dev/null || echo "")
 
-# Check for tabs in original bank (first 100 headers to be efficient)
-# Fixed: use proper command to get count or set to 0
 tabs_in_headers=$(head -n 100 "$ORIGINAL_BANK" 2>/dev/null | grep -c $'^>[^\t]*\t') || tabs_in_headers=0
 
 if [[ -n "$underscores" ]] || [[ "$tabs_in_headers" -gt 0 ]]; then
@@ -134,13 +140,10 @@ if [[ -n "$underscores" ]] || [[ "$tabs_in_headers" -gt 0 ]]; then
 
   TEMP_BANK="${ORIGINAL_BANK%.*}_temp_clean.${ORIGINAL_BANK##*.}"
 
-  # Keep only sequence name (first word), replace underscores
   awk '
   /^>/ {
-      # Get only the first word (sequence name)
       name = $1
       sub(/^>/, "", name)
-      # Replace underscores in the sequence name only
       gsub(/_/, "@UNDERSCORE@", name)
       print ">" name
       next
@@ -157,8 +160,8 @@ else
 fi
 # ============================================
 
-# Defaults
-Slf=${3:-0.9}
+# Defaults (EDITED: Slf default 0.8)
+Slf=${3:-0.8}
 Homology=${4:-65}
 FlankSize=${5:-50}
 KeepSplits=${6:-0}
@@ -233,7 +236,8 @@ for bank in *.2k.part_*.bnk; do
       break
     fi
 
-    if [[ $SKIP_MINUS -eq 1 ]]; then
+    # If minus-bank rounds NOT enabled, stop after first round
+    if [[ $DO_MINUS -eq 0 ]]; then
       break
     fi
 
@@ -295,7 +299,6 @@ if [[ $BEST -eq 1 ]]; then
   | head -n "$BEST_N" \
   > "$taxname-$qname.best${BEST_N}.bed7"
 
-  # BED6 for slop/getfasta: chrom start end name score strand
   awk 'BEGIN{OFS="\t"} {print $1,$2,$3,"tmp",$7,$6}' \
     "$taxname-$qname.best${BEST_N}.bed7" \
   > "$taxname-$qname.best${BEST_N}.bed"
@@ -303,12 +306,10 @@ if [[ $BEST -eq 1 ]]; then
   bedtools slop -s -g "$WORKING_BANK".fai -b 50 -i "$taxname-$qname.best${BEST_N}.bed" \
   > "$taxname-$qname.best${BEST_N}.flank50.tmp.bed"
 
-  # do NOT embed strand in name; bedtools getfasta -s appends it once
   awk 'BEGIN{OFS="\t"} {name=$1":"$2"-"$3; print $1,$2,$3,name,$5,$6}' \
     "$taxname-$qname.best${BEST_N}.flank50.tmp.bed" \
   > "$taxname-$qname.best${BEST_N}.flank50.bed"
 
-  # extra safety: dedupe after slop (rare but possible)
   sort -k1,1 -k2,2n -k3,3n -k6,6 "$taxname-$qname.best${BEST_N}.flank50.bed" \
   | awk 'BEGIN{OFS="\t"}{key=$1"\t"$2"\t"$3"\t"$6; if(!seen[key]++){print}}' \
   > "$taxname-$qname.best${BEST_N}.flank50.uniq.bed"
@@ -340,7 +341,6 @@ rm -f "$taxname.bed"
 if [[ $TEMP_BANK_CREATED -eq 1 ]]; then
   echo "Restoring original sequence names in output files..."
 
-  # Restore underscores (no tabs since we didn't keep descriptions)
   awk '{gsub(/@UNDERSCORE@/,"_")}1' "$taxname-$qname.bed" > "${taxname}-${qname}.bed.tmp"
   mv "${taxname}-${qname}.bed.tmp" "$taxname-$qname.bed"
 
@@ -382,4 +382,4 @@ if [[ $TEMP_BANK_CREATED -eq 1 ]]; then
 fi
 
 Result=$(wc -l "$taxname-$qname.bed")
-echo "Found $Result hits"(base) 
+echo "Found $Result hits"
