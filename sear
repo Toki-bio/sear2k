@@ -1,20 +1,34 @@
-#!/bin/bash
-# sear - A tool for finding short sequences in genomes using ssearch36
-# Author: Sergei Kosushkin
-# Version: 0.2 + tabs fix + BED format fix
-# License: MIT
+set -euo pipefail
+
+# sear - short query search with fragment scanning
 #
-# Usage:
-# sear [-b|--best [N]] [-m|--minus] [-s|--stop [N]] <query.fasta> <bank.fasta> \
-#        [sequence_length_fraction=0.8] [similarity_threshold=65] [flank_size=50] [keep_2k_splits=0]
+# What it does:
+# - Splits a genome into overlapping fragments
+# - Runs ssearch36 against each fragment
+# - Merges hits and extracts sequence with flanks
+# - Optional best-hit selection and MAFFT alignment
 #
-# Notes (2026-02-03 edit):
-#   - Default Slf changed from 0.9 -> 0.8
-#   - Default: NO minus-bank rounds
-#   - -m / --minus enables minus-bank rounds (the ONLY minus-related option)
+# Notes:
+# - Uses @U@ placeholder to keep headers short and restores names on output
+# - Handles split reuse and cleans intermediate files
 
 usage() {
-  echo "Usage: sear [-b|--best [N]] [-m|--minus] [-s|--stop [N]] <query.fasta> <bank.fasta> [Slf=0.8] [Homology=65] [Flank=50] [KeepSplits=0]"
+  cat <<'EOF'
+sear - short query search with fragment scanning (ssearch36 + bedtools)
+
+Usage:
+  sear [options] <query.fasta> <bank.fasta> [Slf=0.8] [Homology=65] [Flank=50] [KeepSplits=0]
+
+Options:
+  -b, --best [N]    Keep top N unique hits by bitscore and run MAFFT (default 100)
+  -m, --minus       Enable minus-bank depletion (multi-round per split)
+  -s, --stop [N]    Stop after N total hits (default 1000)
+  -k, --keep        Keep split files for reuse
+  --slop L,R        Override flank sizes for bed/bnk and best-hit flanks
+
+Notes:
+  --slop uses explicit left/right values. It overrides FlankSize.
+EOF
 }
 
 if [[ $# -eq 0 ]]; then
@@ -23,17 +37,14 @@ if [[ $# -eq 0 ]]; then
   exit 1
 fi
 
-# -----------------------------
-# parse options
-# -----------------------------
 BEST=0
 BEST_N=100
-
-# DEFAULT: do NOT do minus-bank rounds
 DO_MINUS=0
-
 STOP_EARLY=0
 STOP_N=1000
+KEEP_FLAG=0
+SLOP_L=""
+SLOP_R=""
 
 args=()
 while [[ $# -gt 0 ]]; do
@@ -53,7 +64,6 @@ while [[ $# -gt 0 ]]; do
       shift 1
       ;;
     --minus|-m)
-      # ENABLE minus-bank rounds
       DO_MINUS=1
       shift 1
       ;;
@@ -71,6 +81,31 @@ while [[ $# -gt 0 ]]; do
       STOP_N="${1#-s}"
       shift 1
       ;;
+    --keep|-k)
+      KEEP_FLAG=1
+      shift 1
+      ;;
+    --slop)
+      if [[ $# -ge 2 && "$2" =~ ^[0-9]+,[0-9]+$ ]]; then
+        SLOP_L="${2%,*}"
+        SLOP_R="${2#*,}"
+        shift 2
+      else
+        echo "Invalid --slop value (use L,R)"
+        exit 1
+      fi
+      ;;
+    --slop=*)
+      slop_val="${1#--slop=}"
+      if [[ "$slop_val" =~ ^[0-9]+,[0-9]+$ ]]; then
+        SLOP_L="${slop_val%,*}"
+        SLOP_R="${slop_val#*,}"
+        shift 1
+      else
+        echo "Invalid --slop value (use L,R)"
+        exit 1
+      fi
+      ;;
     --)
       shift
       args+=("$@")
@@ -84,7 +119,6 @@ while [[ $# -gt 0 ]]; do
 done
 set -- "${args[@]}"
 
-# After parsing, first two args must be query and bank (and must not be flags)
 if [[ $# -lt 2 || "$1" == -* || "$2" == -* ]]; then
   usage
   exit 1
@@ -93,7 +127,6 @@ fi
 query_in="$1"
 bank_in="$2"
 
-# Validate input files explicitly
 if [[ ! -f "$query_in" ]]; then
   echo "File $query_in: not found"
   exit 1
@@ -103,7 +136,6 @@ if [[ ! -f "$bank_in" ]]; then
   exit 1
 fi
 
-# Verify required programs are available
 need_bins=(ssearch36 bedtools seqkit samtools)
 if [[ $BEST -eq 1 ]]; then
   need_bins+=(mafft)
@@ -119,7 +151,6 @@ ORIGINAL_BANK="$bank_in"
 WORKING_BANK="$bank_in"
 TEMP_BANK_CREATED=0
 
-# Check/create fai
 if [[ -f "$ORIGINAL_BANK".fai ]]; then
   echo "fai index found"
 else
@@ -127,12 +158,9 @@ else
   samtools faidx "$ORIGINAL_BANK"
 fi
 
-# ============================================
-# UNDERSCODE AND TAB WORKAROUND - FIXED VERSION
-# ============================================
-underscores=$(awk '/_/' "$ORIGINAL_BANK".fai 2>/dev/null || echo "")
-
-tabs_in_headers=$(head -n 100 "$ORIGINAL_BANK" 2>/dev/null | grep -c $'^>[^\t]*\t') || tabs_in_headers=0
+underscores=$(awk '/_/' "$ORIGINAL_BANK".fai 2>/dev/null || true)
+tabs_in_headers=$(head -n 100 "$ORIGINAL_BANK" 2>/dev/null | grep -c $'^>[^\t]*\t' || true)
+tabs_in_headers="${tabs_in_headers:-0}"
 
 if [[ -n "$underscores" ]] || [[ "$tabs_in_headers" -gt 0 ]]; then
   echo "WARNING: Bank file contains underscores or tabs in sequence names"
@@ -140,11 +168,12 @@ if [[ -n "$underscores" ]] || [[ "$tabs_in_headers" -gt 0 ]]; then
 
   TEMP_BANK="${ORIGINAL_BANK%.*}_temp_clean.${ORIGINAL_BANK##*.}"
 
+  # KEY FIX: Use @U@ instead of @UNDERSCORE@ (saves 10 chars per underscore!)
   awk '
   /^>/ {
       name = $1
       sub(/^>/, "", name)
-      gsub(/_/, "@UNDERSCORE@", name)
+      gsub(/_/, "@U@", name)
       print ">" name
       next
   }
@@ -158,22 +187,53 @@ if [[ -n "$underscores" ]] || [[ "$tabs_in_headers" -gt 0 ]]; then
 else
   echo "No underscores or tabs detected - using original bank file"
 fi
-# ============================================
 
-# Defaults (EDITED: Slf default 0.8)
 Slf=${3:-0.8}
 Homology=${4:-65}
 FlankSize=${5:-50}
 KeepSplits=${6:-0}
 
-# Query length / overlap length
+MainSlopL="$FlankSize"
+MainSlopR="$FlankSize"
+BestSlopL=50
+BestSlopR=50
+
+if [[ -n "$SLOP_L" ]]; then
+  MainSlopL="$SLOP_L"
+  MainSlopR="$SLOP_R"
+  BestSlopL="$SLOP_L"
+  BestSlopR="$SLOP_R"
+fi
+
+# -k overrides positional KeepSplits
+if [[ $KEEP_FLAG -eq 1 ]]; then
+  KeepSplits=1
+fi
+
 len=$(awk '/^>/{if (l!="") print l; l=0; next}{l+=length($0)}END{print l}' "$query_in")
 flen=$(awk -v a=$Slf -v b=$len 'BEGIN{print int(a*b)}')
 echo "Query length = $len bp, overlap = $flen bp"
 
-# Split bank if needed
-split=$(ls 2>/dev/null | grep "$WORKING_BANK".part_* | grep .2k.part_ | wc -l)
-if [[ $split != "0" ]]; then
+# --- Per-query intermediates cleanup (ALWAYS) ---
+# Do NOT include split files here.
+cleanup_query() {
+  rm -f minus_* \
+        plus_to_add_* \
+        [0-9]*_*.bed \
+        *_s.fai \
+        "$WORKING_BANK".all \
+        "$WORKING_BANK".all_hits.txt \
+        "$WORKING_BANK".all_hits.txt \
+        "$WORKING_BANK".all \
+        "$WORKING_BANK".stripped.genome \
+        "$WORKING_BANK".all_hits.txt \
+        2>/dev/null || true
+}
+trap cleanup_query EXIT
+
+# --- Split creation/reuse (directory-local) ---
+# Create splits only once per working directory (reused across queries in Step1)
+if compgen -G "*.2k.part_*.bnk" >/dev/null 2>&1; then
   echo "skipping 2k split"
 else
   seqkit sliding -g -s 2000 -W 2500 "$WORKING_BANK" > "$WORKING_BANK"."2k.bnk"
@@ -189,7 +249,6 @@ taxname=$(echo "$WORKING_BANK" | cut -c 1-3)
 HIT_COUNT=0
 STOP_NOW=0
 
-# Search
 for bank in *.2k.part_*.bnk; do
   [[ "$bank" == minus_* ]] && continue
   [[ "$bank" == *.fai ]] && continue
@@ -228,7 +287,7 @@ for bank in *.2k.part_*.bnk; do
       break
     fi
 
-    samtools faidx "$bank"
+    samtools faidx "$bank" >/dev/null 2>&1 || true
     sort -V "$bank".fai > "${bank}_s.fai"
 
     if [[ "$Pl" == "0" ]]; then
@@ -236,7 +295,6 @@ for bank in *.2k.part_*.bnk; do
       break
     fi
 
-    # If minus-bank rounds NOT enabled, stop after first round
     if [[ $DO_MINUS -eq 0 ]]; then
       break
     fi
@@ -259,14 +317,32 @@ for bank in *.2k.part_*.bnk; do
   fi
 done
 
-# Offsets (unchanged)
 cat "$WORKING_BANK".all_hits.txt |
   awk '{sub(/_sliding:/," ")}{sub(/_sliding_/," ")}{print $2}' |
   awk '{gsub(/_/," ")}{print}' |
   awk '{gsub(/-/," -")}1' |
   awk '{sum=0;for(i=1;i<=NF;i++)if($i>0)sum+=$i}{print sum}' > "$WORKING_BANK".all
 
-# FINAL BED (bitscore in col7)
+# Create genome file - handle both complete and truncated _sliding suffixes
+awk 'BEGIN{OFS="\t"}
+     {
+       chrom=$1;
+       sub(/_sliding:.*$/, "", chrom);
+       sub(/_sliding_.*$/, "", chrom);
+       sub(/_slidin.*$/, "", chrom);
+       sub(/_slidi.*$/, "", chrom);
+       sub(/_slid.*$/, "", chrom);
+       sub(/_sli.*$/, "", chrom);
+       sub(/_sl.*$/, "", chrom);
+       if (!seen[chrom]) {
+         seen[chrom]=1;
+         len[chrom]=$2;
+       } else if ($2 > len[chrom]) {
+         len[chrom]=$2;
+       }
+     }
+     END { for (c in len) print c, len[c] }' "$WORKING_BANK".fai | sort -V > "$WORKING_BANK".stripped.genome
+
 paste "$WORKING_BANK".all_hits.txt "$WORKING_BANK".all \
 | awk 'BEGIN{OFS="\t"} {print $0, $2+$NF, $3+$NF}' \
 | awk 'BEGIN{OFS="\t"}
@@ -274,17 +350,22 @@ paste "$WORKING_BANK".all_hits.txt "$WORKING_BANK".all \
          chrom=$1
          sub(/_sliding:.*/, "", chrom)
          sub(/_sliding_.*/, "", chrom)
+         sub(/_slidin.*/, "", chrom)
+         sub(/_slidi.*/, "", chrom)
+         sub(/_slid.*/, "", chrom)
+         sub(/_sli.*/, "", chrom)
+         sub(/_sl.*/, "", chrom)
          print chrom, $(NF-1), $NF, $7, $5, $6, $8
        }' \
 | bedtools sort -i - \
-| bedtools slop -l 1 -r -1 -i - -g "$WORKING_BANK".fai \
+| bedtools slop -l 1 -r -1 -i - -g "$WORKING_BANK".stripped.genome \
 | bedtools merge -s -i - -c 4,5,6,7 -o max,max,distinct,max \
 > "$taxname-$qname.bed"
 
-# BEST: top N UNIQUE loci by bitscore + .50 flanks + MAFFT
 if [[ $BEST -eq 1 ]]; then
-  echo "Creating best hits (top $BEST_N UNIQUE hits by bitscore) + 50bp flanks + MAFFT..."
+  echo "Creating best hits (top $BEST_N UNIQUE hits by bitscore) + flanks L=$BestSlopL R=$BestSlopR + MAFFT..."
 
+  set +o pipefail
   paste "$WORKING_BANK".all_hits.txt "$WORKING_BANK".all \
   | awk 'BEGIN{OFS="\t"}
          {
@@ -292,18 +373,24 @@ if [[ $BEST -eq 1 ]]; then
            chrom=$1
            sub(/_sliding:.*/, "", chrom)
            sub(/_sliding_.*/, "", chrom)
+           sub(/_slidin.*/, "", chrom)
+           sub(/_slidi.*/, "", chrom)
+           sub(/_slid.*/, "", chrom)
+           sub(/_sli.*/, "", chrom)
+           sub(/_sl.*/, "", chrom)
            print chrom, $2+off, $3+off, $7, $5, $6, $8
          }' \
   | sort -k7,7nr \
   | awk 'BEGIN{OFS="\t"}{key=$1"\t"$2"\t"$3"\t"$6; if(!seen[key]++){print}}' \
   | head -n "$BEST_N" \
   > "$taxname-$qname.best${BEST_N}.bed7"
+  set -o pipefail
 
   awk 'BEGIN{OFS="\t"} {print $1,$2,$3,"tmp",$7,$6}' \
     "$taxname-$qname.best${BEST_N}.bed7" \
   > "$taxname-$qname.best${BEST_N}.bed"
 
-  bedtools slop -s -g "$WORKING_BANK".fai -b 50 -i "$taxname-$qname.best${BEST_N}.bed" \
+  bedtools slop -s -g "$WORKING_BANK".stripped.genome -l "$BestSlopL" -r "$BestSlopR" -i "$taxname-$qname.best${BEST_N}.bed" \
   > "$taxname-$qname.best${BEST_N}.flank50.tmp.bed"
 
   awk 'BEGIN{OFS="\t"} {name=$1":"$2"-"$3; print $1,$2,$3,name,$5,$6}' \
@@ -317,69 +404,99 @@ if [[ $BEST -eq 1 ]]; then
   bedtools getfasta -s -nameOnly -fi "$WORKING_BANK" -bed "$taxname-$qname.best${BEST_N}.flank50.uniq.bed" \
   > "$taxname-$qname.best${BEST_N}.fa"
 
-  cat "$query" "$taxname-$qname.best${BEST_N}.fa" \
-  | mafft --thread "$(nproc)" --threadtb "$(nproc)" --threadit "$(nproc)" \
-          --localpair --maxiterate 1000 --ep 0.123 --nuc --reorder --quiet - \
-  > "$taxname-$qname.best${BEST_N}.mafft.fa"
+  mafft_in="$taxname-$qname.best${BEST_N}.mafft.in.fa"
+  mafft_out="$taxname-$qname.best${BEST_N}.mafft.fa"
+  mafft_err="$taxname-$qname.best${BEST_N}.mafft.err"
+
+  {
+    cat "$query"
+    echo
+    cat "$taxname-$qname.best${BEST_N}.fa"
+  } > "$mafft_in"
+
+      mafft --thread "$(nproc)" --threadtb "$(nproc)" --threadit "$(nproc)" \
+        --localpair --maxiterate 1000 --ep 0.123 --nuc --reorder --quiet \
+        "$mafft_in" > "$mafft_out" 2> "$mafft_err"
+
+  if [[ ! -s "$mafft_out" ]]; then
+    echo "MAFFT produced empty output. See $mafft_err" >&2
+    exit 1
+  fi
+
+  rm -f "$mafft_in"
 
   rm -f "$taxname-$qname.best${BEST_N}.bed7" "$taxname-$qname.best${BEST_N}.flank50.tmp.bed"
   echo "MAFFT alignment: $taxname-$qname.best${BEST_N}.mafft.fa"
 fi
 
-# FINAL EXTRACTION
 echo "Extracting sequences"
-rm -f *2k.part* "$WORKING_BANK".all "$WORKING_BANK".all_hits.txt "$WORKING_BANK"."2k.bnk"
 
+# Create final extracted bank
 bname="$WORKING_BANK"
-bedtools slop -s -i "$taxname-$qname.bed" -g "$bname.fai" -l "$FlankSize" -r "$FlankSize" > "$taxname.bed"
+bedtools slop -s -i "$taxname-$qname.bed" -g "$WORKING_BANK".stripped.genome -l "$MainSlopL" -r "$MainSlopR" > "$taxname.bed"
 bedtools getfasta -s -fi "$bname" -bed "$taxname.bed" > "$taxname-$qname.bnk"
 rm -f "$taxname.bed"
 
-# ============================================
-# RESTORE ORIGINAL NAMES IF TEMP BANK WAS USED
-# ============================================
 if [[ $TEMP_BANK_CREATED -eq 1 ]]; then
   echo "Restoring original sequence names in output files..."
 
-  awk '{gsub(/@UNDERSCORE@/,"_")}1' "$taxname-$qname.bed" > "${taxname}-${qname}.bed.tmp"
+  awk '{gsub(/@U@/,"_")}1' "$taxname-$qname.bed" > "${taxname}-${qname}.bed.tmp"
   mv "${taxname}-${qname}.bed.tmp" "$taxname-$qname.bed"
 
-  awk '{gsub(/@UNDERSCORE@/,"_")}1' "$taxname-$qname.bnk" > "${taxname}-${qname}.bnk.tmp"
+  awk '{gsub(/@U@/,"_")}1' "$taxname-$qname.bnk" > "${taxname}-${qname}.bnk.tmp"
   mv "${taxname}-${qname}.bnk.tmp" "$taxname-$qname.bnk"
 
   if [[ $BEST -eq 1 ]]; then
-    awk '{gsub(/@UNDERSCORE@/,"_")}1' "$taxname-$qname.best${BEST_N}.bed" > "${taxname}-${qname}.best${BEST_N}.bed.tmp"
+    awk '{gsub(/@U@/,"_")}1' "$taxname-$qname.best${BEST_N}.bed" > "${taxname}-${qname}.best${BEST_N}.bed.tmp"
     mv "${taxname}-${qname}.best${BEST_N}.bed.tmp" "$taxname-$qname.best${BEST_N}.bed"
 
-    awk '{gsub(/@UNDERSCORE@/,"_")}1' "$taxname-$qname.best${BEST_N}.flank50.bed" > "${taxname}-${qname}.best${BEST_N}.flank50.bed.tmp"
+    awk '{gsub(/@U@/,"_")}1' "$taxname-$qname.best${BEST_N}.flank50.bed" > "${taxname}-${qname}.best${BEST_N}.flank50.bed.tmp"
     mv "${taxname}-${qname}.best${BEST_N}.flank50.bed.tmp" "$taxname-$qname.best${BEST_N}.flank50.bed"
 
-    awk '{gsub(/@UNDERSCORE@/,"_")}1' "$taxname-$qname.best${BEST_N}.flank50.uniq.bed" > "${taxname}-${qname}.best${BEST_N}.flank50.uniq.bed.tmp"
+    awk '{gsub(/@U@/,"_")}1' "$taxname-$qname.best${BEST_N}.flank50.uniq.bed" > "${taxname}-${qname}.best${BEST_N}.flank50.uniq.bed.tmp"
     mv "${taxname}-${qname}.best${BEST_N}.flank50.uniq.bed.tmp" "$taxname-$qname.best${BEST_N}.flank50.uniq.bed"
 
-    awk '{gsub(/@UNDERSCORE@/,"_")}1' "$taxname-$qname.best${BEST_N}.fa" > "${taxname}-${qname}.best${BEST_N}.fa.tmp"
+    awk '{gsub(/@U@/,"_")}1' "$taxname-$qname.best${BEST_N}.fa" > "${taxname}-${qname}.best${BEST_N}.fa.tmp"
     mv "${taxname}-${qname}.best${BEST_N}.fa.tmp" "$taxname-$qname.best${BEST_N}.fa"
 
-    awk '{gsub(/@UNDERSCORE@/,"_")}1' "$taxname-$qname.best${BEST_N}.mafft.fa" > "${taxname}-${qname}.best${BEST_N}.mafft.fa.tmp"
+    awk '{gsub(/@U@/,"_")}1' "$taxname-$qname.best${BEST_N}.mafft.fa" > "${taxname}-${qname}.best${BEST_N}.mafft.fa.tmp"
     mv "${taxname}-${qname}.best${BEST_N}.mafft.fa.tmp" "$taxname-$qname.best${BEST_N}.mafft.fa"
   fi
 
   echo "Cleanup complete"
 fi
 
+if [[ $BEST -eq 1 ]]; then
+  rm -f "$taxname-$qname.best${BEST_N}.bed" \
+        "$taxname-$qname.best${BEST_N}.bed7" \
+        "$taxname-$qname.best${BEST_N}.fa" \
+        "$taxname-$qname.best${BEST_N}.flank50.bed" \
+        "$taxname-$qname.best${BEST_N}.flank50.tmp.bed" \
+        "$taxname-$qname.best${BEST_N}.flank50.uniq.bed" \
+        "$taxname-$qname.best${BEST_N}.mafft.err" \
+        2>/dev/null || true
+fi
+
+# Remove aux fai files created for parts (these are not reused)
 rm -f *2k.bnk.fai *_s.fai 2>/dev/null || true
 
+# Split files: keep or remove depending on KeepSplits
 if [[ $KeepSplits -eq 0 ]]; then
-  rm -f *2k.bnk *2k.bnk.fai *_s.fai
+  rm -f *.2k.bnk *.2k.bnk.fai *.2k.part_* *.2k.part_*.bnk.fai *_s.fai 2>/dev/null || true
   echo "Temporary split files removed"
 else
   echo "Temporary split files kept for re-use"
 fi
 
+# Temporary cleaned bank: always remove (matches your original behavior)
 if [[ $TEMP_BANK_CREATED -eq 1 ]]; then
   echo "Removing temporary cleaned bank file..."
-  rm -f "$TEMP_BANK" "$TEMP_BANK".fai
+  rm -f "$TEMP_BANK" "$TEMP_BANK".fai 2>/dev/null || true
 fi
 
-Result=$(wc -l "$taxname-$qname.bed")
-echo "Found $Result hits"
+# Always cleanup minus + per-query intermediates
+cleanup_query
+trap - EXIT
+
+Result=$(wc -l "$taxname-$qname.bed" 2>/dev/null || true)
+echo "Result lines: $Result"
