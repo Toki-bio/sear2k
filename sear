@@ -1,4 +1,3 @@
-#!/usr/bin/env bash
 set -euo pipefail
 
 # sear - short query search with fragment scanning
@@ -164,24 +163,30 @@ tabs_in_headers=$(head -n 100 "$ORIGINAL_BANK" 2>/dev/null | grep -c $'^>[^\t]*\
 tabs_in_headers="${tabs_in_headers:-0}"
 
 if [[ -n "$underscores" ]] || [[ "$tabs_in_headers" -gt 0 ]]; then
-  echo "WARNING: Bank file contains underscores or tabs in sequence names"
-  echo "Creating temporary copy with simple sequence names..."
-
   TEMP_BANK="${ORIGINAL_BANK%.*}_temp_clean.${ORIGINAL_BANK##*.}"
 
-  # KEY FIX: Use @U@ instead of @UNDERSCORE@ (saves 10 chars per underscore!)
-  awk '
-  /^>/ {
-      name = $1
-      sub(/^>/, "", name)
-      gsub(/_/, "@U@", name)
-      print ">" name
-      next
-  }
-  { print }
-  ' "$ORIGINAL_BANK" > "$TEMP_BANK"
+  # Reuse existing cleaned bank if it is newer than the original
+  if [[ -f "$TEMP_BANK" && -f "$TEMP_BANK".fai && "$TEMP_BANK" -nt "$ORIGINAL_BANK" ]]; then
+    echo "Reusing existing cleaned bank: $TEMP_BANK"
+  else
+    echo "WARNING: Bank file contains underscores or tabs in sequence names"
+    echo "Creating temporary copy with simple sequence names..."
 
-  samtools faidx "$TEMP_BANK"
+    # KEY FIX: Use @U@ instead of @UNDERSCORE@ (saves 10 chars per underscore!)
+    awk '
+    /^>/ {
+        name = $1
+        sub(/^>/, "", name)
+        gsub(/_/, "@U@", name)
+        print ">" name
+        next
+    }
+    { print }
+    ' "$ORIGINAL_BANK" > "$TEMP_BANK"
+
+    samtools faidx "$TEMP_BANK"
+  fi
+
   WORKING_BANK="$TEMP_BANK"
   TEMP_BANK_CREATED=1
   echo "Using temporary cleaned bank: $WORKING_BANK"
@@ -224,7 +229,10 @@ cleanup_query() {
         *_s.fai \
         "$WORKING_BANK".all \
         "$WORKING_BANK".all_hits.txt \
+        "$WORKING_BANK".all_hits.txt \
+        "$WORKING_BANK".all \
         "$WORKING_BANK".stripped.genome \
+        "$WORKING_BANK".all_hits.txt \
         2>/dev/null || true
 }
 trap cleanup_query EXIT
@@ -239,7 +247,7 @@ else
 fi
 
 query="$query_in"
-qname=$(basename "${query%.*}")
+qname="${query%.*}"
 taxname=$(echo "$WORKING_BANK" | cut -c 1-3)
 
 : > "$WORKING_BANK".all_hits.txt
@@ -253,6 +261,7 @@ for bank in *.2k.part_*.bnk; do
   [[ "$bank" == *_s.fai ]] && continue
 
   echo "searching $query in $bank"
+  taxname=$(echo "$bank" | cut -c 1-3)
 
   round=1
   Pl=1
@@ -411,9 +420,9 @@ if [[ $BEST -eq 1 ]]; then
     cat "$taxname-$qname.best${BEST_N}.fa"
   } > "$mafft_in"
 
-  mafft --thread "$(nproc)" --threadtb "$(nproc)" --threadit "$(nproc)" \
-    --localpair --maxiterate 1000 --ep 0.123 --nuc --reorder --quiet \
-    "$mafft_in" > "$mafft_out" 2> "$mafft_err"
+      mafft --thread "$(nproc)" --threadtb "$(nproc)" --threadit "$(nproc)" \
+        --localpair --maxiterate 1000 --ep 0.123 --nuc --reorder --quiet \
+        "$mafft_in" > "$mafft_out" 2> "$mafft_err"
 
   if [[ ! -s "$mafft_out" ]]; then
     echo "MAFFT produced empty output. See $mafft_err" >&2
@@ -444,8 +453,18 @@ if [[ $TEMP_BANK_CREATED -eq 1 ]]; then
   mv "${taxname}-${qname}.bnk.tmp" "$taxname-$qname.bnk"
 
   if [[ $BEST -eq 1 ]]; then
-    # Only restore names in files that survive cleanup (.mafft.fa)
-    # .bed, .flank50.bed, .flank50.uniq.bed, .fa are deleted below
+    awk '{gsub(/@U@/,"_")}1' "$taxname-$qname.best${BEST_N}.bed" > "${taxname}-${qname}.best${BEST_N}.bed.tmp"
+    mv "${taxname}-${qname}.best${BEST_N}.bed.tmp" "$taxname-$qname.best${BEST_N}.bed"
+
+    awk '{gsub(/@U@/,"_")}1' "$taxname-$qname.best${BEST_N}.flank50.bed" > "${taxname}-${qname}.best${BEST_N}.flank50.bed.tmp"
+    mv "${taxname}-${qname}.best${BEST_N}.flank50.bed.tmp" "$taxname-$qname.best${BEST_N}.flank50.bed"
+
+    awk '{gsub(/@U@/,"_")}1' "$taxname-$qname.best${BEST_N}.flank50.uniq.bed" > "${taxname}-${qname}.best${BEST_N}.flank50.uniq.bed.tmp"
+    mv "${taxname}-${qname}.best${BEST_N}.flank50.uniq.bed.tmp" "$taxname-$qname.best${BEST_N}.flank50.uniq.bed"
+
+    awk '{gsub(/@U@/,"_")}1' "$taxname-$qname.best${BEST_N}.fa" > "${taxname}-${qname}.best${BEST_N}.fa.tmp"
+    mv "${taxname}-${qname}.best${BEST_N}.fa.tmp" "$taxname-$qname.best${BEST_N}.fa"
+
     awk '{gsub(/@U@/,"_")}1' "$taxname-$qname.best${BEST_N}.mafft.fa" > "${taxname}-${qname}.best${BEST_N}.mafft.fa.tmp"
     mv "${taxname}-${qname}.best${BEST_N}.mafft.fa.tmp" "$taxname-$qname.best${BEST_N}.mafft.fa"
   fi
@@ -475,10 +494,14 @@ else
   echo "Temporary split files kept for re-use"
 fi
 
-# Temporary cleaned bank: always remove (matches your original behavior)
+# Temporary cleaned bank: keep when -k is set (reused across queries)
 if [[ $TEMP_BANK_CREATED -eq 1 ]]; then
-  echo "Removing temporary cleaned bank file..."
-  rm -f "$TEMP_BANK" "$TEMP_BANK".fai 2>/dev/null || true
+  if [[ $KeepSplits -eq 0 ]]; then
+    echo "Removing temporary cleaned bank file..."
+    rm -f "$TEMP_BANK" "$TEMP_BANK".fai 2>/dev/null || true
+  else
+    echo "Temporary cleaned bank kept for re-use"
+  fi
 fi
 
 # Always cleanup minus + per-query intermediates
