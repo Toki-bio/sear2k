@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 set -euo pipefail
 
 # sear - short query search with fragment scanning
@@ -20,11 +21,21 @@ Usage:
   sear [options] <query.fasta> <bank.fasta> [Slf=0.8] [Homology=65] [Flank=50] [KeepSplits=0]
 
 Options:
-  -b, --best [N]    Keep top N unique hits by bitscore and run MAFFT (default 100)
+  -b, --best [N]    Keep top N unique hits by bitscore and run MAFFT.
+                    Default N=100 (ssearch36 mode).
+                    Minimap2 mode auto-sets N=10 (query <5 kb) or N=5 (≥5 kb)
+                    unless an explicit N is given.
   -m, --minus       Enable minus-bank depletion (multi-round per split)
   -s, --stop [N]    Stop after N total hits (default 1000)
   -k, --keep        Keep split files for reuse
   --slop L,R        Override flank sizes for bed/bnk and best-hit flanks
+  --force-ssearch   Use ssearch36 even for queries ≥1000 bp (skip minimap2)
+
+Minimap2 mode (automatic for queries ≥1000 bp):
+  Searches the genome directly with minimap2 instead of fragment-scanning
+  with ssearch36.  Uses a sensitivity cascade: asm5 → asm10 → asm20,
+  stopping at the first preset that finds hits.
+  Override with --force-ssearch to always use ssearch36.
 
 Notes:
   --slop uses explicit left/right values. It overrides FlankSize.
@@ -39,10 +50,12 @@ fi
 
 BEST=0
 BEST_N=100
+BEST_N_EXPLICIT=0
 DO_MINUS=0
 STOP_EARLY=0
 STOP_N=1000
 KEEP_FLAG=0
+FORCE_SSEARCH=0
 SLOP_L=""
 SLOP_R=""
 
@@ -53,6 +66,7 @@ while [[ $# -gt 0 ]]; do
       BEST=1
       if [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]]; then
         BEST_N="$2"
+        BEST_N_EXPLICIT=1
         shift 2
       else
         shift 1
@@ -61,6 +75,7 @@ while [[ $# -gt 0 ]]; do
     -b[0-9]*)
       BEST=1
       BEST_N="${1#-b}"
+      BEST_N_EXPLICIT=1
       shift 1
       ;;
     --minus|-m)
@@ -83,6 +98,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --keep|-k)
       KEEP_FLAG=1
+      shift 1
+      ;;
+    --force-ssearch)
+      FORCE_SSEARCH=1
       shift 1
       ;;
     --slop)
@@ -136,7 +155,7 @@ if [[ ! -f "$bank_in" ]]; then
   exit 1
 fi
 
-need_bins=(ssearch36 bedtools seqkit samtools)
+need_bins=(bedtools samtools)
 if [[ $BEST -eq 1 ]]; then
   need_bins+=(mafft)
 fi
@@ -220,22 +239,118 @@ len=$(awk '/^>/{if (l!="") print l; l=0; next}{l+=length($0)}END{print l}' "$que
 flen=$(awk -v a=$Slf -v b=$len 'BEGIN{print int(a*b)}')
 echo "Query length = $len bp, overlap = $flen bp"
 
+query="$query_in"
+qname="${query%.*}"
+taxname=$(echo "$WORKING_BANK" | cut -c 1-3)
+
 # --- Per-query intermediates cleanup (ALWAYS) ---
-# Do NOT include split files here.
 cleanup_query() {
-  rm -f minus_* \
-        plus_to_add_* \
-        [0-9]*_*.bed \
-        *_s.fai \
-        "$WORKING_BANK".all \
-        "$WORKING_BANK".all_hits.txt \
-        "$WORKING_BANK".all_hits.txt \
-        "$WORKING_BANK".all \
-        "$WORKING_BANK".stripped.genome \
-        "$WORKING_BANK".all_hits.txt \
-        2>/dev/null || true
+  rm -f minus_* plus_to_add_* _ssearch_sorted_* [0-9]*_*.bed *_s.fai \
+       "$WORKING_BANK".all "$WORKING_BANK".all_hits.txt \
+       "$WORKING_BANK".stripped.genome "$WORKING_BANK".minimap_raw.txt \
+       2>/dev/null || true
 }
 trap cleanup_query EXIT
+
+# ═══════════════════════════════════════════════════════════════════════
+# Detect minimap2 mode (query ≥ 1000 bp)
+# ═══════════════════════════════════════════════════════════════════════
+MINIMAP_MODE=0
+if [[ $len -ge 1000 && $FORCE_SSEARCH -eq 0 ]]; then
+  if command -v minimap2 >/dev/null 2>&1; then
+    MINIMAP_MODE=1
+  else
+    echo "WARNING: minimap2 not found — falling back to ssearch36 mode"
+  fi
+fi
+
+if [[ $MINIMAP_MODE -eq 1 ]]; then
+  echo "Query >= 1000 bp — minimap2 mode (cascade: asm5 → asm10 → asm20)"
+
+  # Auto-adjust -b N when not explicitly set
+  if [[ $BEST -eq 1 && $BEST_N_EXPLICIT -eq 0 ]]; then
+    if [[ $len -lt 5000 ]]; then
+      BEST_N=10
+    else
+      BEST_N=5
+    fi
+    echo "Auto-setting -b to $BEST_N (query ${len} bp)"
+  fi
+
+  # .stripped.genome for bedtools (no _sliding suffixes in minimap2 mode)
+  awk 'BEGIN{OFS="\t"} {print $1, $2}' "$WORKING_BANK".fai \
+    | sort -V > "$WORKING_BANK".stripped.genome
+
+  # Cascade: asm5 → asm10 → asm20 (stop at first preset with hits)
+  MM2_FOUND=0
+  for preset in asm5 asm10 asm20; do
+    echo "  minimap2 -x $preset ..."
+    minimap2 -x "$preset" \
+      -t "${THREADS:-$(nproc 2>/dev/null || echo 1)}" \
+      --secondary=yes -p 0.3 -N 10000 \
+      "$WORKING_BANK" "$query" 2>/dev/null \
+    | awk 'BEGIN{OFS="\t"}
+        {
+          if (NF < 12) next
+          strand = $5; if (strand != "+" && strand != "-") next
+          tname  = $6; tstart = $8+0; tend = $9+0
+          matches = $10+0; blocklen = $11+0
+          if (blocklen <= 0) next
+          pct_id = matches / blocklen * 100
+          alen   = tend - tstart
+          as = 0
+          for (i = 13; i <= NF; i++) {
+            if ($i ~ /^AS:i:/) { split($i, a, ":"); as = a[3]+0 }
+          }
+          print tname, tstart, tend, pct_id, alen, strand, as
+        }' > "$WORKING_BANK".minimap_raw.txt
+
+    mm2_n=$(wc -l < "$WORKING_BANK".minimap_raw.txt)
+    echo "  $preset: $mm2_n raw alignments"
+    if [[ $mm2_n -gt 0 ]]; then
+      MM2_FOUND=1
+      break
+    fi
+  done
+
+  if [[ $MM2_FOUND -eq 0 ]]; then
+    echo "No hits from minimap2 — empty result"
+    : > "$taxname-$qname.bed"
+  else
+    # Filter by homology + min length, merge overlapping hits
+    awk -v hom="$Homology" -v minlen="$flen" \
+      'BEGIN{OFS="\t"} $4 >= hom && $5 >= minlen' \
+      "$WORKING_BANK".minimap_raw.txt \
+    | bedtools sort -i - 2>/dev/null \
+    | bedtools merge -s -i - -c 4,5,6,7 -o max,max,distinct,max 2>/dev/null \
+    > "$taxname-$qname.bed"
+
+    # Apply -s / --stop limit (keep top N by bitscore)
+    if [[ $STOP_EARLY -eq 1 ]]; then
+      sort -k7,7nr "$taxname-$qname.bed" \
+        | head -n "$STOP_N" \
+        | bedtools sort -i - 2>/dev/null \
+        > "$taxname-$qname.bed.tmp"
+      mv "$taxname-$qname.bed.tmp" "$taxname-$qname.bed"
+    fi
+
+    echo "$(wc -l < "$taxname-$qname.bed") merged hits"
+  fi
+
+  rm -f "$WORKING_BANK".minimap_raw.txt
+
+else
+# ═══════════════════════════════════════════════════════════════════════
+# ssearch36 mode (original fragment-scanning approach)
+# ═══════════════════════════════════════════════════════════════════════
+
+# Check ssearch36-mode dependencies
+for b in ssearch36 seqkit; do
+  if ! command -v "$b" >/dev/null 2>&1; then
+    echo "Program $b: not found in PATH"
+    exit 1
+  fi
+done
 
 # --- Split creation/reuse (directory-local) ---
 # Create splits only once per working directory (reused across queries in Step1)
@@ -245,10 +360,6 @@ else
   seqkit sliding -g -s 2000 -W 2500 "$WORKING_BANK" > "$WORKING_BANK"."2k.bnk"
   seqkit split2 -p 20 -O . "$WORKING_BANK"."2k.bnk"
 fi
-
-query="$query_in"
-qname="${query%.*}"
-taxname=$(echo "$WORKING_BANK" | cut -c 1-3)
 
 : > "$WORKING_BANK".all_hits.txt
 
@@ -270,16 +381,23 @@ for bank in *.2k.part_*.bnk; do
     echo "round $round"
     echo "$query $bank"
 
-    ssearch36 -g -3 -T 24 -Q -n -z 11 -E 2 -w 95 -W 70 -m 8C "$query" "$bank" 3 \
+    ssearch36 -g -3 -T "${THREADS:-$(nproc 2>/dev/null || echo 1)}" -Q -n -z 11 -E 2 -w 95 -W 70 -m 8C "$query" "$bank" 3 \
     | awk '/^[^#]/ {
         printf($2"\t"$9-1"\t"$10"\t"$10-$9+1"\t");
         if ($8-$7>0) print $8-$7+1"\t+\t"$3"\t"$12;
         else print -($8-$7+1)"\t-\t"$3"\t"$12
       }' \
-    | sort -V \
-    | bedtools merge -s -c 4,5,6,7,8 -o max,max,distinct,max,max \
-    | awk '{if ($7>='"$Homology"' && $4>='"$flen"') print}' \
-    | sort -V > plus_to_add_"$round"_"$bank".bed
+    | sort -V > _ssearch_sorted_"$round"_"$bank".tmp
+
+    if [[ -s _ssearch_sorted_"$round"_"$bank".tmp ]]; then
+      bedtools merge -s -c 4,5,6,7,8 -o max,max,distinct,max,max \
+        < _ssearch_sorted_"$round"_"$bank".tmp 2>/dev/null \
+      | awk '{if ($7>='"$Homology"' && $4>='"$flen"') print}' \
+      | sort -V > plus_to_add_"$round"_"$bank".bed
+    else
+      : > plus_to_add_"$round"_"$bank".bed
+    fi
+    rm -f _ssearch_sorted_"$round"_"$bank".tmp
 
     Pl=$(wc -l < plus_to_add_"$round"_"$bank".bed)
     echo "$Pl hits"
@@ -308,9 +426,9 @@ for bank in *.2k.part_*.bnk; do
     echo "creating minus bank"
     cat plus_to_add_*_"$bank".bed | sort -V > "$round"_"$bank".bed
 
-    bedtools complement -i "$round"_"$bank".bed -g "${bank}_s.fai" \
-      | bedtools sort -i \
-      | bedtools getfasta -s -fi "$bank" -bed - \
+    bedtools complement -i "$round"_"$bank".bed -g "${bank}_s.fai" 2>/dev/null \
+      | bedtools sort -i 2>/dev/null \
+      | bedtools getfasta -s -fi "$bank" -bed - 2>/dev/null \
       | awk '/^>/ && a!=1 {gsub(/[":"]/, "_")}{gsub(/["()"]/,"");a=1};a=0;1' > minus_"$round"_"$bank"
 
     bank=$(echo "minus_${round}_${bank}")
@@ -363,41 +481,50 @@ paste "$WORKING_BANK".all_hits.txt "$WORKING_BANK".all \
          sub(/_sl.*/, "", chrom)
          print chrom, $(NF-1), $NF, $7, $5, $6, $8
        }' \
-| bedtools sort -i - \
-| bedtools slop -l 1 -r -1 -i - -g "$WORKING_BANK".stripped.genome \
-| bedtools merge -s -i - -c 4,5,6,7 -o max,max,distinct,max \
+| bedtools sort -i - 2>/dev/null \
+| bedtools slop -l 1 -r -1 -i - -g "$WORKING_BANK".stripped.genome 2>/dev/null \
+| bedtools merge -s -i - -c 4,5,6,7 -o max,max,distinct,max 2>/dev/null \
 > "$taxname-$qname.bed"
+
+fi  # end minimap2/ssearch36 mode selection
 
 if [[ $BEST -eq 1 ]]; then
   echo "Creating best hits (top $BEST_N UNIQUE hits by bitscore) + flanks L=$BestSlopL R=$BestSlopR + MAFFT..."
 
-  set +o pipefail
-  paste "$WORKING_BANK".all_hits.txt "$WORKING_BANK".all \
-  | awk 'BEGIN{OFS="\t"}
-         {
-           off=$NF
-           chrom=$1
-           sub(/_sliding:.*/, "", chrom)
-           sub(/_sliding_.*/, "", chrom)
-           sub(/_slidin.*/, "", chrom)
-           sub(/_slidi.*/, "", chrom)
-           sub(/_slid.*/, "", chrom)
-           sub(/_sli.*/, "", chrom)
-           sub(/_sl.*/, "", chrom)
-           print chrom, $2+off, $3+off, $7, $5, $6, $8
-         }' \
-  | sort -k7,7nr \
-  | awk 'BEGIN{OFS="\t"}{key=$1"\t"$2"\t"$3"\t"$6; if(!seen[key]++){print}}' \
-  | head -n "$BEST_N" \
-  > "$taxname-$qname.best${BEST_N}.bed7"
-  set -o pipefail
+  if [[ $MINIMAP_MODE -eq 1 ]]; then
+    # minimap2: coordinates already genome-scale — just rank by bitscore
+    sort -k7,7nr "$taxname-$qname.bed" | head -n "$BEST_N" \
+      > "$taxname-$qname.best${BEST_N}.bed7"
+  else
+    set +o pipefail
+    paste "$WORKING_BANK".all_hits.txt "$WORKING_BANK".all \
+    | awk 'BEGIN{OFS="\t"}
+           {
+             off=$NF
+             chrom=$1
+             sub(/_sliding:.*/, "", chrom)
+             sub(/_sliding_.*/, "", chrom)
+             sub(/_slidin.*/, "", chrom)
+             sub(/_slidi.*/, "", chrom)
+             sub(/_slid.*/, "", chrom)
+             sub(/_sli.*/, "", chrom)
+             sub(/_sl.*/, "", chrom)
+             print chrom, $2+off, $3+off, $7, $5, $6, $8
+           }' \
+    | bedtools sort -i - 2>/dev/null \
+    | bedtools merge -s -i - -c 4,5,6,7 -o max,max,distinct,max 2>/dev/null \
+    | sort -k7,7nr \
+    | head -n "$BEST_N" \
+    > "$taxname-$qname.best${BEST_N}.bed7"
+    set -o pipefail
+  fi
 
   awk 'BEGIN{OFS="\t"} {print $1,$2,$3,"tmp",$7,$6}' \
     "$taxname-$qname.best${BEST_N}.bed7" \
   > "$taxname-$qname.best${BEST_N}.bed"
 
   bedtools slop -s -g "$WORKING_BANK".stripped.genome -l "$BestSlopL" -r "$BestSlopR" -i "$taxname-$qname.best${BEST_N}.bed" \
-  > "$taxname-$qname.best${BEST_N}.flank50.tmp.bed"
+  2>/dev/null > "$taxname-$qname.best${BEST_N}.flank50.tmp.bed"
 
   awk 'BEGIN{OFS="\t"} {name=$1":"$2"-"$3; print $1,$2,$3,name,$5,$6}' \
     "$taxname-$qname.best${BEST_N}.flank50.tmp.bed" \
@@ -408,7 +535,7 @@ if [[ $BEST -eq 1 ]]; then
   > "$taxname-$qname.best${BEST_N}.flank50.uniq.bed"
 
   bedtools getfasta -s -nameOnly -fi "$WORKING_BANK" -bed "$taxname-$qname.best${BEST_N}.flank50.uniq.bed" \
-  > "$taxname-$qname.best${BEST_N}.fa"
+  2>/dev/null > "$taxname-$qname.best${BEST_N}.fa"
 
   mafft_in="$taxname-$qname.best${BEST_N}.mafft.in.fa"
   mafft_out="$taxname-$qname.best${BEST_N}.mafft.fa"
@@ -420,7 +547,7 @@ if [[ $BEST -eq 1 ]]; then
     cat "$taxname-$qname.best${BEST_N}.fa"
   } > "$mafft_in"
 
-      mafft --thread "$(nproc)" --threadtb "$(nproc)" --threadit "$(nproc)" \
+      mafft --thread "${THREADS:-$(nproc 2>/dev/null || echo 1)}" --threadtb "${THREADS:-$(nproc 2>/dev/null || echo 1)}" --threadit "${THREADS:-$(nproc 2>/dev/null || echo 1)}" \
         --localpair --maxiterate 1000 --ep 0.123 --nuc --reorder --quiet \
         "$mafft_in" > "$mafft_out" 2> "$mafft_err"
 
@@ -439,8 +566,8 @@ echo "Extracting sequences"
 
 # Create final extracted bank
 bname="$WORKING_BANK"
-bedtools slop -s -i "$taxname-$qname.bed" -g "$WORKING_BANK".stripped.genome -l "$MainSlopL" -r "$MainSlopR" > "$taxname.bed"
-bedtools getfasta -s -fi "$bname" -bed "$taxname.bed" > "$taxname-$qname.bnk"
+bedtools slop -s -i "$taxname-$qname.bed" -g "$WORKING_BANK".stripped.genome -l "$MainSlopL" -r "$MainSlopR" 2>/dev/null > "$taxname.bed"
+bedtools getfasta -s -fi "$bname" -bed "$taxname.bed" 2>/dev/null > "$taxname-$qname.bnk"
 rm -f "$taxname.bed"
 
 if [[ $TEMP_BANK_CREATED -eq 1 ]]; then
@@ -487,11 +614,13 @@ fi
 rm -f *2k.bnk.fai *_s.fai 2>/dev/null || true
 
 # Split files: keep or remove depending on KeepSplits
-if [[ $KeepSplits -eq 0 ]]; then
-  rm -f *.2k.bnk *.2k.bnk.fai *.2k.part_* *.2k.part_*.bnk.fai *_s.fai 2>/dev/null || true
-  echo "Temporary split files removed"
-else
-  echo "Temporary split files kept for re-use"
+if [[ $MINIMAP_MODE -eq 0 ]]; then
+  if [[ $KeepSplits -eq 0 ]]; then
+    rm -f *.2k.bnk *.2k.bnk.fai *.2k.part_* *.2k.part_*.bnk.fai *_s.fai 2>/dev/null || true
+    echo "Temporary split files removed"
+  else
+    echo "Temporary split files kept for re-use"
+  fi
 fi
 
 # Temporary cleaned bank: keep when -k is set (reused across queries)
