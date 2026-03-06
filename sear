@@ -235,6 +235,13 @@ if [[ $KEEP_FLAG -eq 1 ]]; then
   KeepSplits=1
 fi
 
+# Clean up any stale files from previous queries BEFORE starting
+echo "Cleaning up any stale files from prior runs..."
+rm -f minus_* plus_to_add_* _ssearch_sorted_* [0-9]*_*.bed *_s.fai \
+     "$WORKING_BANK".all "$WORKING_BANK".all_hits.txt \
+     "$WORKING_BANK".stripped.genome "$WORKING_BANK".minimap_raw.txt \
+     2>/dev/null || true
+
 len=$(awk '/^>/{if (l!="") print l; l=0; next}{l+=length($0)}END{print l}' "$query_in")
 flen=$(awk -v a=$Slf -v b=$len 'BEGIN{print int(a*b)}')
 echo "Query length = $len bp, overlap = $flen bp"
