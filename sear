@@ -301,10 +301,16 @@ if [[ $MINIMAP_MODE -eq 1 ]]; then
           if (NF < 12) next
           strand = $5; if (strand != "+" && strand != "-") next
           tname  = $6; tstart = $8+0; tend = $9+0
-          matches = $10+0; blocklen = $11+0
-          if (blocklen <= 0) next
-          pct_id = matches / blocklen * 100
-          alen   = tend - tstart
+          qstart = $3+0; qend = $4+0
+          matches = $10+0
+          if (tend <= tstart || qend <= qstart) next
+          qlen_aln = qend - qstart
+          tlen_aln = tend - tstart
+          # Identity: matches / min(query_len, target_len) to penalize gaps
+          min_len = (qlen_aln < tlen_aln) ? qlen_aln : tlen_aln
+          if (min_len <= 0) next
+          pct_id = matches / min_len * 100
+          alen   = tlen_aln
           as = 0
           for (i = 13; i <= NF; i++) {
             if ($i ~ /^AS:i:/) { split($i, a, ":"); as = a[3]+0 }
