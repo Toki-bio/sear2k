@@ -288,9 +288,9 @@ if [[ $MINIMAP_MODE -eq 1 ]]; then
   awk 'BEGIN{OFS="\t"} {print $1, $2}' "$WORKING_BANK".fai \
     | sort -V > "$WORKING_BANK".stripped.genome
 
-  # Cascade: asm5 → asm10 → asm20 (stop at first preset with hits)
+  # Cascade: asm5 → asm10 → asm20 (stop at first preset with hits that are LONG)
   MM2_FOUND=0
-  for preset in asm5 asm10 asm20; do
+  for preset in asm10 asm20; do
     echo "  minimap2 -x $preset ..."
     minimap2 -x "$preset" \
       -t "${THREADS:-$(nproc 2>/dev/null || echo 1)}" \
