@@ -218,9 +218,6 @@ Homology=${4:-65}
 FlankSize=${5:-50}
 KeepSplits=${6:-0}
 
-# For minimap2, use lower default homology (will override below if MINIMAP_MODE=1)
-MINIMAP_HOMOLOGY_DEFAULT=30
-
 MainSlopL="$FlankSize"
 MainSlopR="$FlankSize"
 BestSlopL=50
@@ -269,13 +266,6 @@ fi
 
 if [[ $MINIMAP_MODE -eq 1 ]]; then
   echo "Query >= 1000 bp — minimap2 mode (cascade: asm5 → asm10 → asm20)"
-
-  # Use lower homology threshold for minimap2 unless user explicitly set it
-  # (if it's at default 65, switch to 30 for minimap2)
-  if [[ ${4:-unset} == "unset" ]]; then
-    Homology=$MINIMAP_HOMOLOGY_DEFAULT
-    echo "Minimap2 mode: using Homology=$Homology (default for minimap2)"
-  fi
 
   # Auto-adjust -b N when not explicitly set
   if [[ $BEST -eq 1 && $BEST_N_EXPLICIT -eq 0 ]]; then
