@@ -2,12 +2,12 @@
 
 `sear` scans a genome FASTA with short query sequences using `ssearch36`, splitting the genome into overlapping fragments to avoid boundary misses. It merges fragment hits back into genome coordinates, extracts sequence with flanks, and can optionally keep the top-N best hits and align them with MAFFT.
 
-For **queries ≥ 1000 bp**, sear automatically switches to `minimap2` for faster whole-genome alignment (no fragment scanning needed). This is especially useful for LINE reconstruction or other long-element searches.
+For **queries ≥ 1000 bp**, sear automatically switches to `minimap2`, with the query as the index and the genome streamed through as overlapping windows. This is what makes it work for repeats such as LINEs (see Minimap2 mode).
 
 ## Highlights
 
 - Fragmented scanning (2500 bp windows, 2000 bp step) for short queries
-- **Automatic minimap2 mode** for queries ≥ 1000 bp with sensitivity cascade (asm5 → asm10 → asm20)
+- **Automatic minimap2 mode** for queries ≥ 1000 bp: query indexed, genome as overlapping windows, base-level alignments (`-c`)
 - Strand-aware merging and coordinate reconstruction
 - Optional best-hit selection + MAFFT alignment with auto-sizing for long queries
 - Safe handling of long headers and cleanup of intermediates
@@ -19,13 +19,13 @@ Required:
 - `ssearch36` (FASTA package) — for queries < 1000 bp
 - `minimap2` — for queries ≥ 1000 bp (auto-detected)
 - `bedtools`
-- `seqkit` — for queries < 1000 bp (fragment splitting)
+- `seqkit` — genome windows (both modes)
 - `samtools`
 
 Optional (best-hit mode):
 - `mafft`
 
-Note: `ssearch36` and `seqkit` are only required in ssearch36 mode (queries < 1000 bp). If you only use sear with long queries and have `minimap2`, they are not needed.
+Note: `ssearch36` is only required in ssearch36 mode (queries < 1000 bp).
 
 ## Install
 
@@ -56,22 +56,23 @@ Notes:
 
 ## Minimap2 mode
 
-When the query is **≥ 1000 bp**, sear automatically uses `minimap2` instead of ssearch36 fragment-scanning. This is transparent — the output format (BED7) is identical.
+When the query is **≥ 1000 bp**, sear uses `minimap2` instead of ssearch36. The output format (BED7) is the same.
 
-**Sensitivity cascade:** sear tries minimap2 presets in order of stringency:
-1. `asm5` (≤ 5% divergence)
-2. `asm10` (≤ 10% divergence)
-3. `asm20` (≤ 20% divergence)
+**How:** the roles are swapped. The query is minimap2's reference and the genome is streamed through `seqkit sliding` as overlapping windows (the "reads"): step `max(query length, 2 kb)`, width `step + query length + 1 kb`, so every copy up to query length + 1 kb lies whole inside at least one window. Alignments are base-level (`-x map-ont -k 11 -w 3 -c`); hits from overlapping windows are merged, then the usual identity and length filters apply. Nothing is written to disk but the hits.
 
-It stops at the first preset that returns any hits. This ensures the most exact matches are preferred while still finding divergent copies.
+**Why:** indexing the genome instead (what sear did before 2026-10) loses almost every copy of an interspersed repeat, because its minimizers occur hundreds of times and minimap2 drops high-occurrence seeds. Test on human chr21 with L1.3 (6 kb) against RepeatMasker: the old mode found 4 of 73 full-length L1s, the swapped mode 65 at any length; with sear's default length rule (hit ≥ 0.8 × query) it keeps 52, as many as blastn dc-megablast keeps under the same rule (50). The old mode also ran without `-c`, so identity read ~70 % for 98 % copies and the score column was always 0.
+
+**Columns:** identity = matching bases / alignment block length (PAF `$10/$11`); score = minimap2 `AS:i`.
+
+**Settings:** `map-ont` with `-k 11 -w 3` by default. Set `SEAR_MM2_PRESET` (e.g. `asm20`) or `SEAR_MM2_OPTS` (e.g. `"-k 15 -w 10"`) to change them. The denser seeds raised recall on a 1.5 kb L1 3′ end from 77 % to 89 % of dc-megablast's loci, for about twice the time (a 6 kb query takes ~9 s on human chr21 and ~2 min on a 1.65 Gbp genome with 4 threads).
 
 **`-b` auto-sizing (minimap2 mode only):** When `-b` is used without an explicit N:
 - Query < 5000 bp → `-b 10` (10 best hits + MAFFT alignment)
 - Query ≥ 5000 bp → `-b 5` (5 best hits + MAFFT alignment)
 
-An explicit value (e.g. `-b 20`) always overrides auto-sizing.
+An explicit value (e.g. `-b 20`) always overrides auto-sizing. Best hits are ranked by `AS`.
 
-**Override:** `--force-ssearch` disables minimap2 and forces ssearch36 for all query lengths.
+**Override:** `--force-ssearch` uses ssearch36 for any query length. ssearch36 scans 2.5 kb windows, so it can only report hits up to 2500 bp: if query length × Slf exceeds that (above 3125 bp at Slf 0.8), sear warns and skips the search instead of returning an empty result after a full scan.
 
 ## Examples
 
