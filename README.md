@@ -48,6 +48,7 @@ Options:
 - `-k, --keep`: keep split files for reuse
 - `--slop L,R`: override flank sizes for output bed/bnk and best-hit flanks
 - `--force-ssearch`: disable minimap2 auto-switch, always use ssearch36
+- `--mode regular|fast`, `--fast` (or `SEAR_MODE=fast`): fast mode runs round 1 with `fasta36` (ktup 6; HSPs within 50 bp count as one locus for the length rule) and then one `ssearch36 -z 1` round on the minus bank, the fragments with the round-1 loci cut out, so what fasta36 misses ssearch36 still finds. Same loci within 0.1 %, about 2x faster (more on hit-rich families). Needs `fasta36` in PATH.
 
 Notes:
 - `--slop` overrides the positional `Flank` value.
